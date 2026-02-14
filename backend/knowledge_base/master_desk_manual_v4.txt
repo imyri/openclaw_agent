@@ -1,0 +1,15 @@
+// OPENCLAW MASTER EXECUTION MANUAL V4
+// DO NOT DEVIATE FROM THESE RULES.
+
+1. TIMEFRAME ALIGNMENT:
+   - Monthly defines the overarching narrative.
+   - Daily identifies the draw on liquidity.
+   - 1H identifies the execution POI.
+   - 5m is strictly for execution via MSS.
+
+2. POI VALIDATION:
+   - An Order Block (OB) is only valid if it resulted in an aggressive displacement leaving a Fair Value Gap (FVG).
+   - A Balanced Price Range (BPR) supersedes a standard FVG in probability.
+
+3. LIQUIDITY AXIOM:
+   - Never enter a trade without a clear, un-swept liquidity pool (old highs/lows) as the target.
