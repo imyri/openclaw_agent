@@ -1,83 +1,150 @@
-import ccxt
+from __future__ import annotations
+
 import logging
+
+from sqlalchemy.orm import Session
+
+from core.config import settings
+from core.database import TradeRecord
+from core.exchange import get_exchange_instance
+from models.schemas import AIDecision
 
 logger = logging.getLogger("openclaw.position_manager")
 
+
 class PositionManager:
     """
-    Handles order routing, position sizing, and RR math.
+    Handles order validation, RR checks, sizing, and testnet execution.
     """
-    def __init__(self, api_key: str, secret: str, risk_per_trade_percent: float = 0.01):
-        self.exchange = ccxt.binanceusdm({
-            'apiKey': api_key,
-            'secret': secret,
-            'enableRateLimit': True,
-        })
+
+    def __init__(self, risk_per_trade_percent: float = 0.01, min_rr_ratio: float = 3.0):
+        self.exchange = get_exchange_instance()
         self.risk_percent = risk_per_trade_percent
-        self.min_rr_ratio = 3.0 # Hardcoded 1:3 RR
+        self.min_rr_ratio = min_rr_ratio
 
-    def validate_and_execute(self, ai_decision: dict, current_price: float, account_balance: float):
-        """
-        Intercepts the AI's JSON output. If the math doesn't make sense, it rejects the trade.
-        """
-        if ai_decision.get("action") not in ["LONG", "SHORT"]:
-            return {"status": "ignored", "reason": "AI decided to WAIT or invalid action."}
+    def validate_and_execute(
+        self,
+        ai_decision: AIDecision,
+        symbol: str,
+        current_price: float,
+        account_balance: float,
+        db: Session,
+    ) -> dict:
+        if ai_decision.action not in ("LONG", "SHORT"):
+            return {"status": "ignored", "reason": "AI decided WAIT."}
 
-        action = ai_decision["action"]
-        entry = current_price # Simplified for market execution
-        target = float(ai_decision.get("target_liquidity"))
-        fvg_level = float(ai_decision["reasoning_data"]["closest_fvg"]) # Assume AI passes this
-        
-        # 1. Math: Calculate Stop Loss (Placed just outside the FVG/OB)
-        if action == "LONG":
-            stop_loss = fvg_level * 0.999 # Add a tiny spread cushion
+        entry = ai_decision.entry_poi or current_price
+        target = ai_decision.target_liquidity
+        stop_reference = ai_decision.stop_reference
+
+        if target is None or stop_reference is None:
+            return {"status": "rejected", "reason": "Missing target_liquidity or stop_reference."}
+
+        if ai_decision.action == "LONG":
+            stop_loss = stop_reference * 0.999
             risk_distance = entry - stop_loss
             reward_distance = target - entry
-        else: # SHORT
-            stop_loss = fvg_level * 1.001
+        else:
+            stop_loss = stop_reference * 1.001
             risk_distance = stop_loss - entry
             reward_distance = entry - target
 
         if risk_distance <= 0 or reward_distance <= 0:
-            logger.error("Invalid Math: Risk or Reward distance is negative.")
-            return {"status": "rejected", "reason": "Mathematical error in AI targets."}
+            logger.error("Invalid trade math: risk_distance=%s reward_distance=%s", risk_distance, reward_distance)
+            return {"status": "rejected", "reason": "Invalid risk/reward distances."}
 
-        # 2. Risk Shield: Enforce 1:3 RR
-        actual_rr = reward_distance / risk_distance
-        if actual_rr < self.min_rr_ratio:
-            logger.warning(f"Trade Rejected. Required RR: 1:3. Actual RR: 1:{round(actual_rr, 2)}.")
-            return {"status": "rejected", "reason": "Insufficient Risk/Reward Ratio."}
+        rr_ratio = reward_distance / risk_distance
+        if rr_ratio < self.min_rr_ratio:
+            return {
+                "status": "rejected",
+                "reason": f"Insufficient RR ratio: {rr_ratio:.2f}. Required: {self.min_rr_ratio:.2f}.",
+            }
 
-        # 3. Math: Calculate Position Size based on Account Balance
         monetary_risk = account_balance * self.risk_percent
         position_size = monetary_risk / risk_distance
-        
-        # 4. Execution via CCXT
-        return self._place_binance_orders("BTC/USDT", action, position_size, stop_loss, target)
+        if position_size <= 0:
+            return {"status": "rejected", "reason": "Computed position size <= 0."}
 
-    def _place_binance_orders(self, symbol: str, action: str, amount: float, sl: float, tp: float):
-        """
-        Executes the trade on Binance Futures using ccxt.
-        Places entry, then attaches STOP_MARKET and TAKE_PROFIT_MARKET orders.
-        """
-        side = 'buy' if action == 'LONG' else 'sell'
-        inverted_side = 'sell' if side == 'buy' else 'buy'
+        execution_result = self._place_binance_orders(
+            symbol=symbol,
+            action=ai_decision.action,
+            amount=position_size,
+            stop_loss=stop_loss,
+            take_profit=target,
+        )
+
+        trade_record = TradeRecord(
+            symbol=symbol,
+            action=ai_decision.action,
+            entry_price=entry,
+            stop_loss=stop_loss,
+            take_profit=target,
+            position_size=position_size,
+            status="OPEN" if execution_result["status"] == "executed" else "FAILED",
+            exchange_order_id=execution_result.get("entry_order_id"),
+        )
+        db.add(trade_record)
+        db.commit()
+        db.refresh(trade_record)
+
+        execution_result["position_size"] = position_size
+        execution_result["entry_price"] = entry
+        execution_result["trade_id"] = trade_record.id
+        return execution_result
+
+    def _place_binance_orders(
+        self,
+        symbol: str,
+        action: str,
+        amount: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> dict:
+        side = "buy" if action == "LONG" else "sell"
+        inverse_side = "sell" if side == "buy" else "buy"
+
+        if not settings.ENABLE_TESTNET:
+            return {"status": "failed", "reason": "ENABLE_TESTNET is false. Execution blocked."}
+
+        if not settings.EXECUTE_ORDERS:
+            return {
+                "status": "executed",
+                "entry_order_id": "paper-order",
+                "reason": "EXECUTE_ORDERS disabled; simulated fill.",
+            }
 
         try:
-            # Place Market Entry
-            entry_order = self.exchange.create_order(symbol, 'MARKET', side, amount)
-            
-            # Place Stop Loss (Must use closePosition=True for Futures)
-            sl_params = {'stopPrice': sl, 'closePosition': True}
-            sl_order = self.exchange.create_order(symbol, 'STOP_MARKET', inverted_side, amount, None, sl_params)
-            
-            # Place Take Profit
-            tp_params = {'stopPrice': tp, 'closePosition': True}
-            tp_order = self.exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', inverted_side, amount, None, tp_params)
-
-            logger.info(f"SUCCESS: Executed {action} on {symbol}. SL: {sl}, TP: {tp}")
-            return {"status": "executed", "entry": entry_order['id']}
-            
-        except Exception as e:
-            logger.critical(f"CCXT Execution Failed: {e}")
-            return {"status": "failed", "reason": str(e)}
+            entry_order = self.exchange.create_order(symbol, "MARKET", side, amount)
+            sl_order = self.exchange.create_order(
+                symbol,
+                "STOP_MARKET",
+                inverse_side,
+                amount,
+                None,
+                {"stopPrice": stop_loss, "closePosition": True},
+            )
+            tp_order = self.exchange.create_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                inverse_side,
+                amount,
+                None,
+                {"stopPrice": take_profit, "closePosition": True},
+            )
+            logger.info(
+                "Executed %s %s on testnet. Entry=%s SL=%s TP=%s",
+                action,
+                symbol,
+                entry_order.get("id"),
+                sl_order.get("id"),
+                tp_order.get("id"),
+            )
+            return {
+                "status": "executed",
+                "entry_order_id": entry_order.get("id"),
+                "stop_order_id": sl_order.get("id"),
+                "tp_order_id": tp_order.get("id"),
+            }
+        except Exception as exc:
+            logger.critical("CCXT testnet execution failed: %s", exc)
+            return {"status": "failed", "reason": str(exc)}

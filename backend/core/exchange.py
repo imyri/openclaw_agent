@@ -1,21 +1,28 @@
-import ccxt
 import logging
+
+import ccxt
+
 from core.config import settings
 
 logger = logging.getLogger("openclaw.exchange")
 
+
 def get_exchange_instance():
-    """Initializes and returns the authenticated ccxt Binance instance."""
+    """Initializes an authenticated Binance USDM ccxt client in testnet mode only."""
     try:
-        exchange = ccxt.binanceusdm({
-            'apiKey': settings.BINANCE_API_KEY,
-            'secret': settings.BINANCE_SECRET_KEY,
-            'enableRateLimit': True,
-        })
+        if not settings.ENABLE_TESTNET:
+            raise RuntimeError("ENABLE_TESTNET must be true. Real-money mode is disabled in this build.")
+
+        exchange = ccxt.binanceusdm(
+            {
+                "apiKey": settings.BINANCE_API_KEY,
+                "secret": settings.BINANCE_SECRET_KEY,
+                "enableRateLimit": True,
+            }
+        )
         exchange.set_sandbox_mode(True)
-        # Optional: Test connection in prod
-        # exchange.check_required_credentials()
+        logger.info("TESTNET MODE ENABLED for Binance Futures execution.")
         return exchange
-    except Exception as e:
-        logger.critical(f"Failed to initialize exchange: {e}")
+    except Exception as exc:
+        logger.critical("Failed to initialize exchange: %s", exc)
         raise

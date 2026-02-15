@@ -1,8 +1,6 @@
-
 services:
-  # 1. The Command-Centre UI (Next.js)
   frontend:
-    build: 
+    build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: openclaw_frontend
@@ -12,32 +10,66 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws/ai-feed
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - openclaw_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then(()=>process.exit(0)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
 
-  # 2. The Core Microservices (FastAPI & Python Engine)
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: openclaw_backend
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     env_file:
       - .env
     volumes:
-      - ./backend/knowledge_base:/app/knowledge_base 
-      - ./backend/core/logs:/app/core/logs           
+      - ./backend/knowledge_base:/app/knowledge_base
+      - ./backend/core/logs:/app/core/logs
     depends_on:
-      - database
-      - ollama-brain
+      database:
+        condition: service_healthy
+      ollama-brain:
+        condition: service_healthy
+    networks:
+      - openclaw_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: openclaw_worker
+    command: ["python", "worker.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./backend/knowledge_base:/app/knowledge_base
+      - ./backend/core/logs:/app/core/logs
+    depends_on:
+      backend:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+      ollama-brain:
+        condition: service_healthy
     networks:
       - openclaw_network
     restart: unless-stopped
 
-  # 3. State & Risk Tracker (PostgreSQL)
   database:
     image: postgres:15-alpine
     container_name: openclaw_db
@@ -50,8 +82,12 @@ services:
     networks:
       - openclaw_network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # 4. The LLM Brain (CPU-Only Mode for Intel)
   ollama-brain:
     image: ollama/ollama:latest
     container_name: openclaw_ollama
@@ -62,12 +98,16 @@ services:
     networks:
       - openclaw_network
     restart: always
-    # Removed the NVIDIA GPU deploy block so this runs safely on your CPU
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
 
 networks:
   openclaw_network:
     driver: bridge
 
 volumes:
-  openclaw_pgdata:   
+  openclaw_pgdata:
   openclaw_models:

@@ -17,7 +17,14 @@ class JSONParser:
             decision = json.loads(clean_str)
             
             # Validate required keys exist to prevent downstream KeyError
-            required_keys = ["action", "confidence", "reasoning", "entry_poi", "target_liquidity"]
+            required_keys = [
+                "action",
+                "confidence",
+                "reasoning",
+                "entry_poi",
+                "target_liquidity",
+                "stop_reference",
+            ]
             for key in required_keys:
                 if key not in decision:
                     raise ValueError(f"Missing required key: {key}")
@@ -39,5 +46,6 @@ class JSONParser:
             "confidence": 0,
             "reasoning": "System parsing failure. Defaulting to WAIT to preserve capital.",
             "entry_poi": None,
-            "target_liquidity": None
+            "target_liquidity": None,
+            "stop_reference": None,
         }

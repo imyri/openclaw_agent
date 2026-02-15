@@ -24,6 +24,7 @@ class PromptBuilder:
             "confidence": <integer 0-100>,
             "reasoning": "<Reference the POI, FVG, and Target Liquidity. Max 2 sentences.>",
             "entry_poi": "<price float or null>",
-            "target_liquidity": "<price float or null>"
+            "target_liquidity": "<price float or null>",
+            "stop_reference": "<price float or null>"
         }}
         """

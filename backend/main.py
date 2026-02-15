@@ -1,11 +1,22 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import aiohttp
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-import json
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from core.config import settings
+from core.database import SessionLocal, TradeRecord, get_db
+from core.logger import setup_logger
+from models.schemas import ExecutionEvent, RiskState
+
+logger = setup_logger("openclaw.api")
 
 app = FastAPI(title="OpenClaw Command-Centre API")
 
-# Allow the Next.js frontend to connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -14,8 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ConnectionManager:
-    """Manages active WebSocket connections to broadcast AI thoughts."""
     def __init__(self):
         self.active_connections: list[WebSocket] = []
 
@@ -24,38 +35,106 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        """Pushes structured JSON to all connected Next.js clients."""
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception:
-                pass
+                self.disconnect(connection)
+
 
 manager = ConnectionManager()
 
+
+def _build_risk_state(db: Session) -> RiskState:
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = db.execute(
+        text("SELECT current_pnl_r, killswitch_active FROM daily_state WHERE date_id = :date_id"),
+        {"date_id": today},
+    ).fetchone()
+
+    daily_pnl_r = float(row[0]) if row else 0.0
+    killswitch_active = bool(row[1]) if row else False
+
+    active_trades = db.query(TradeRecord).filter(TradeRecord.status == "OPEN").all()
+    active_trade_payload = [
+        {
+            "id": trade.id,
+            "symbol": trade.symbol,
+            "action": trade.action,
+            "entry_price": trade.entry_price,
+            "stop_loss": trade.stop_loss,
+            "take_profit": trade.take_profit,
+            "created_at": trade.created_at.isoformat() if trade.created_at else None,
+        }
+        for trade in active_trades
+    ]
+
+    return RiskState(
+        daily_pnl_r=daily_pnl_r,
+        max_drawdown_limit=-settings.MAX_DAILY_DRAWDOWN_R,
+        killswitch_active=killswitch_active,
+        active_trades=active_trade_payload,
+    )
+
+
 @app.websocket("/ws/ai-feed")
 async def ai_feed_endpoint(websocket: WebSocket):
-    """The WebSocket tunnel for the frontend."""
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive. 
-            # In production, worker.py will call manager.broadcast() 
-            # every time the DecisionEngine outputs a new JSON thought.
-            data = await websocket.receive_text() 
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-@app.get("/api/risk-state")
-async def get_risk_state():
-    """REST endpoint for initial dashboard load (PnL, Drawdown, Active Trades)."""
-    # Fetch from SQLite database updated by execution/risk_guard.py
-    return {
-        "daily_pnl_r": 0.5,
-        "max_drawdown_limit": -2.0,
-        "killswitch_active": False,
-        "active_trades": []
-    }
+
+@app.post("/internal/ai-event")
+async def ingest_ai_event(
+    event: ExecutionEvent,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    if x_internal_token != settings.INTERNAL_API_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized internal event")
+
+    payload = event.model_dump(mode="json")
+    await manager.broadcast(payload)
+    return {"status": "ok"}
+
+
+@app.get("/api/risk-state", response_model=RiskState)
+async def get_risk_state(db: Session = Depends(get_db)):
+    return _build_risk_state(db)
+
+
+@app.get("/health/live")
+async def health_live():
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    checks = {"database": False, "ollama": False}
+
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = True
+    except Exception as exc:
+        logger.error("Readiness DB check failed: %s", exc)
+    finally:
+        db.close()
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags") as response:
+                checks["ollama"] = response.status == 200
+    except Exception as exc:
+        logger.error("Readiness Ollama check failed: %s", exc)
+
+    if not all(checks.values()):
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})
+    return {"status": "ready", "checks": checks}

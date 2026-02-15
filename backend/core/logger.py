@@ -17,13 +17,16 @@ class JSONFormatter(logging.Formatter):
 def setup_logger(name: str):
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
-    
-    # Console output
+
     handler = logging.StreamHandler()
     handler.setFormatter(JSONFormatter())
-    
-    # Avoid duplicate logs if instantiated multiple times
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        root.addHandler(handler)
+
     if not logger.handlers:
         logger.addHandler(handler)
-        
+
     return logger

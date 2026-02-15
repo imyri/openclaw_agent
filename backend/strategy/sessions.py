@@ -1,5 +1,4 @@
 from datetime import datetime, time
-import pytz
 import logging
 
 logger = logging.getLogger("openclaw.sessions")
@@ -9,8 +8,6 @@ class SessionManager:
     Strictly enforces UTC canonical session times and overlap killzones.
     """
     def __init__(self):
-        self.utc_zone = pytz.utc
-
         # Defined strictly in UTC as per OpenClaw architectural rules
         self.sessions = {
             "SYDNEY": {"open": time(22, 0), "close": time(7, 0)},

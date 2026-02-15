@@ -1,100 +1,94 @@
+from __future__ import annotations
+
 import json
-import aiohttp
 import logging
-from typing import Dict, Any
+from pathlib import Path
+
+import aiohttp
+
+from ai.parser import JSONParser
+from core.config import settings
+from models.schemas import AIDecision, MarketState
 
 logger = logging.getLogger("openclaw.llm_brain")
 
+
 class DecisionEngine:
     """
-    The LLM Brain for OpenClaw-Class.
-    Acts as a strict probabilistic engine evaluating quantitative data against the master execution manual.
+    LLM policy evaluator against the master execution guide.
     """
-    def __init__(self, model_name: str = "deepseek-r1:7b"):
-        self.model_name = model_name
-        self.ollama_url = "http://localhost:11434/api/generate"
+
+    def __init__(self):
+        self.model_name = settings.OLLAMA_MODEL
+        self.ollama_url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate"
         self.system_prompt = self._load_execution_guide()
-        
+
     def _load_execution_guide(self) -> str:
-        """
-        Loads the institutional rules. This acts as the unshakeable daily checklist for the AI.
-        """
-        try:
-            with open("knowledge_base/master_desk_manual_v4.txt", "r") as f:
-                return f.read()
-        except FileNotFoundError:
-            logger.critical("master_desk_manual_v4.txt not found! Halting execution capability.")
-            raise FileNotFoundError("The AI cannot operate without its institutional knowledge base.")
+        guide_path = Path(__file__).resolve().parents[1] / "knowledge_base" / "master_desk_manual_v4.txt"
+        if not guide_path.exists():
+            logger.critical("Execution guide not found at %s", guide_path)
+            raise FileNotFoundError("Missing master_desk_manual_v4.txt")
+        return guide_path.read_text(encoding="utf-8")
 
-    def _build_prompt(self, market_state: Dict[str, Any]) -> str:
-        """
-        Constructs the strict, JSON-enforced prompt for the LLM.
-        """
+    def _build_prompt(self, market_state: MarketState) -> str:
+        market_json = market_state.model_dump_json(indent=2)
         return f"""
-        You are the OpenClaw-Class Autonomous Execution Agent.
-        Your logic is strictly governed by the provided institutional execution guide.
-        
-        CORE AXIOM: A POI without Liquidity offers zero mathematical edge. 
-        Prioritize capital preservation over frequency of trades.
-        
-        Current Quantitative Market State:
-        {json.dumps(market_state, indent=2)}
-        
-        Evaluate this state against your daily execution checklist. 
-        Are the time filters valid? Is there a valid MSS with an FVG? Is there clear target liquidity?
-        
-        Output ONLY valid JSON in the exact following format. Do not include markdown formatting or extra text.
-        {{
-            "action": "LONG" | "SHORT" | "WAIT",
-            "confidence": <int 0-100>,
-            "reasoning": "<Strictly reference the POI, FVG, and Target Liquidity. Max 2 sentences.>",
-            "entry_poi": "<price level or null>",
-            "target_liquidity": "<price level or null>"
-        }}
-        """
+You are the OpenClaw-Class Autonomous Execution Agent.
+Your logic is strictly governed by the provided institutional execution guide.
 
-    async def evaluate_market(self, market_state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Sends the market state to the local LLM and parses the JSON decision.
-        Runs asynchronously to prevent blocking the live price feed.
-        """
-        prompt = self._build_prompt(market_state)
-        
+CORE AXIOM: A POI without Liquidity offers zero mathematical edge.
+Prioritize capital preservation over frequency of trades.
+
+Current Quantitative Market State:
+{market_json}
+
+Evaluate the state and respond ONLY as JSON in the exact shape below:
+{{
+  "action": "LONG" | "SHORT" | "WAIT",
+  "confidence": <int 0-100>,
+  "reasoning": "<max 2 concise sentences>",
+  "entry_poi": <float or null>,
+  "target_liquidity": <float or null>,
+  "stop_reference": <float or null>
+}}
+"""
+
+    async def evaluate_market(self, market_state: MarketState) -> AIDecision:
         payload = {
             "model": self.model_name,
             "system": self.system_prompt,
-            "prompt": prompt,
-            "format": "json",  # Forces Ollama to strictly output valid JSON
+            "prompt": self._build_prompt(market_state),
+            "format": "json",
             "stream": False,
-            "options": {
-                "temperature": 0.0, # Complete determinism; no creative hallucinations allowed
-                "num_ctx": 4096     # Ensure enough context window for the master manual
-            }
+            "options": {"temperature": 0.0, "num_ctx": 4096},
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=settings.OLLAMA_TIMEOUT_SECS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(self.ollama_url, json=payload) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        raw_response = data.get("response", "{}")
-                        decision = json.loads(raw_response)
-                        
-                        logger.info(f"AI Decision Output: {json.dumps(decision)}")
-                        return decision
-                    else:
-                        logger.error(f"Ollama API returned status: {response.status}")
-                        return self._default_wait_state("LLM API Error")
-        except Exception as e:
-            logger.error(f"Failed to connect to local LLM: {e}")
-            return self._default_wait_state("Connection Failure")
-            
-    def _default_wait_state(self, reason: str) -> Dict[str, Any]:
-        """Fail-safe state. If anything breaks, we default to capital preservation."""
-        return {
-            "action": "WAIT",
-            "confidence": 0,
-            "reasoning": f"System default to WAIT due to: {reason}. Prioritizing capital preservation.",
-            "entry_poi": None,
-            "target_liquidity": None
-        }
+                    if response.status != 200:
+                        logger.error("Ollama status=%s", response.status)
+                        return self._default_wait_state("LLM API Error", market_state.stop_reference)
+
+                    data = await response.json()
+                    raw_response = data.get("response", "{}")
+                    parsed = JSONParser.parse_ai_decision(raw_response)
+                    decision = AIDecision(**parsed)
+                    if decision.stop_reference is None:
+                        decision.stop_reference = market_state.stop_reference
+                    logger.info("AI decision: %s", json.dumps(decision.model_dump(mode="json")))
+                    return decision
+        except Exception as exc:
+            logger.error("Failed to evaluate market via Ollama: %s", exc)
+            return self._default_wait_state("Connection Failure", market_state.stop_reference)
+
+    def _default_wait_state(self, reason: str, stop_reference: float | None) -> AIDecision:
+        return AIDecision(
+            action="WAIT",
+            confidence=0,
+            reasoning=f"System defaulted to WAIT: {reason}.",
+            entry_poi=None,
+            target_liquidity=None,
+            stop_reference=stop_reference,
+        )

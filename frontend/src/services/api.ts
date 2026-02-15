@@ -6,6 +6,6 @@ export function fetchRiskState() {
     .then(res => res.json())
     .catch(err => {
       console.error("Failed to fetch risk state", err);
-      return { daily_pnl_r: 0, killswitch_active: false };
+      return { daily_pnl_r: 0, killswitch_active: false, active_trades: [] };
     });
 }
