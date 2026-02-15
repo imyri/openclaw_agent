@@ -65,7 +65,9 @@ class QuantitativeEngine:
         """
         self.df = self.detect_fair_value_gaps()
         self.df = self.map_market_structure()
-        
+        if self.df.empty or len(self.df) < 5:
+            print("Waiting for more candle data...")
+            return {"status": "WAITING_DATA"}
         latest = self.df.iloc[-1]
         
         # Only flag a POI if the math proves it exists

@@ -12,6 +12,7 @@ def get_exchange_instance():
             'secret': settings.BINANCE_SECRET_KEY,
             'enableRateLimit': True,
         })
+        exchange.set_sandbox_mode(True)
         # Optional: Test connection in prod
         # exchange.check_required_credentials()
         return exchange

@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   # 1. The Command-Centre UI (Next.js)
@@ -29,8 +28,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./backend/knowledge_base:/app/knowledge_base # Mount master manual for hot-swapping
-      - ./backend/core/logs:/app/core/logs           # Persist forensic JSON logs
+      - ./backend/knowledge_base:/app/knowledge_base 
+      - ./backend/core/logs:/app/core/logs           
     depends_on:
       - database
       - ollama-brain
@@ -52,7 +51,7 @@ services:
       - openclaw_network
     restart: always
 
-  # 4. The LLM Brain (Ollama with GPU Acceleration)
+  # 4. The LLM Brain (CPU-Only Mode for Intel)
   ollama-brain:
     image: ollama/ollama:latest
     container_name: openclaw_ollama
@@ -63,18 +62,12 @@ services:
     networks:
       - openclaw_network
     restart: always
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # Removed the NVIDIA GPU deploy block so this runs safely on your CPU
 
 networks:
   openclaw_network:
     driver: bridge
 
 volumes:
-  openclaw_pgdata:   # Persists Daily PnL and active trade states
-  openclaw_models:   # Persists downloaded LLM models so they aren't wiped on restart
+  openclaw_pgdata:   
+  openclaw_models:
